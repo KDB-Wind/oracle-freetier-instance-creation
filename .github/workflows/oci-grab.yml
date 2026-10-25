@@ -2,7 +2,7 @@ name: OCI Free Instance Grab
 
 on:
   schedule:
-    # every 30 minutes (GitHub cron, UTC). Delay of a few minutes is normal.
+    # every 30 minutes (GitHub cron, UTC). A few minutes of delay is normal.
     - cron: '*/30 * * * *'
   workflow_dispatch: {}
 
@@ -30,11 +30,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Guard - check required secrets
+        id: guard
+        run: |
+          missing=0
+          for v in OCI_USER OCI_TENANCY OCI_FINGERPRINT OCI_REGION OCI_PRIVATE_KEY SSH_PUBLIC_KEY; do
+            if [ -z "${!v}" ]; then echo "::warning::Secret ${v} is not set yet"; missing=1; fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "### ⏸ Skipped: secrets not configured yet (normal until the Oracle account is registered)." >> $GITHUB_STEP_SUMMARY
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip == 'false'
         with:
           python-version: '3.11'
 
       - name: Write OCI config files from secrets
+        if: steps.guard.outputs.skip == 'false'
         run: |
           set -e -o pipefail
           W="$GITHUB_WORKSPACE"
@@ -42,11 +58,7 @@ jobs:
           printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=%s/oci_api_private_key.pem\n' \
             "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" "$W" > oci_config
           printf '%s\n' "$OCI_PRIVATE_KEY" > oci_api_private_key.pem
-          if [ -n "$SSH_PUBLIC_KEY" ]; then
-            printf '%s\n' "$SSH_PUBLIC_KEY" > id_rsa.pub
-          else
-            rm -f id_rsa.pub id_rsa_auto_generated
-          fi
+          printf '%s\n' "$SSH_PUBLIC_KEY" > id_rsa.pub
           cat > oci.env <<EENV
           OCI_CONFIG=$W/oci_config
           OCT_FREE_AD=${OCI_AD:-AD-1}
@@ -70,9 +82,11 @@ jobs:
           sed -e 's/^\(user\|fingerprint\|tenancy\)=.*/\1=<redacted>/' oci_config
 
       - name: Install dependencies
+        if: steps.guard.outputs.skip == 'false'
         run: pip install -r requirements.txt
 
       - name: Run instance grab loop
+        if: steps.guard.outputs.skip == 'false'
         run: |
           # main.py loops until success; cap it below job timeout (exit 124 = normal timeout)
           timeout --signal=SIGTERM 1320 python main.py 2>&1 | tee grab_run.log || ec=$?
@@ -82,7 +96,7 @@ jobs:
             cat INSTANCE_CREATED >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Upload logs and generated keys
+      - name: Upload logs (no private keys)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -91,6 +105,5 @@ jobs:
             INSTANCE_CREATED
             grab_run.log
             *.log
-            *_auto_generated
           if-no-files-found: ignore
           retention-days: 90
