@@ -1,0 +1,96 @@
+name: OCI Free Instance Grab
+
+on:
+  schedule:
+    # every 30 minutes (GitHub cron, UTC). Delay of a few minutes is normal.
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: oci-grab
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OCI_USER: ${{ secrets.OCI_USER }}
+      OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_AD: ${{ secrets.OCI_AD }}
+      OCI_SUBNET_ID_SECRET: ${{ secrets.OCI_SUBNET_ID }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      DISCORD_WEBHOOK_SECRET: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Write OCI config files from secrets
+        run: |
+          set -e -o pipefail
+          W="$GITHUB_WORKSPACE"
+          umask 077
+          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=%s/oci_api_private_key.pem\n' \
+            "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" "$W" > oci_config
+          printf '%s\n' "$OCI_PRIVATE_KEY" > oci_api_private_key.pem
+          if [ -n "$SSH_PUBLIC_KEY" ]; then
+            printf '%s\n' "$SSH_PUBLIC_KEY" > id_rsa.pub
+          else
+            rm -f id_rsa.pub id_rsa_auto_generated
+          fi
+          cat > oci.env <<EENV
+          OCI_CONFIG=$W/oci_config
+          OCT_FREE_AD=${OCI_AD:-AD-1}
+          DISPLAY_NAME=oci-free-arm
+          OCI_COMPUTE_SHAPE=VM.Standard.A1.Flex
+          SECOND_MICRO_INSTANCE=False
+          REQUEST_WAIT_TIME_SECS=60
+          SSH_AUTHORIZED_KEYS_FILE=$W/id_rsa.pub
+          OCI_SUBNET_ID=$OCI_SUBNET_ID_SECRET
+          OCI_IMAGE_ID=
+          OPERATING_SYSTEM="Canonical Ubuntu"
+          OS_VERSION=22.04
+          ASSIGN_PUBLIC_IP=true
+          BOOT_VOLUME_SIZE=50
+          NOTIFY_EMAIL=False
+          EMAIL=
+          EMAIL_PASSWORD=
+          DISCORD_WEBHOOK=$DISCORD_WEBHOOK_SECRET
+          EENV
+          echo "--- config written (keys redacted) ---"
+          sed -e 's/^\(user\|fingerprint\|tenancy\)=.*/\1=<redacted>/' oci_config
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run instance grab loop
+        run: |
+          # main.py loops until success; cap it below job timeout (exit 124 = normal timeout)
+          timeout --signal=SIGTERM 1320 python main.py 2>&1 | tee grab_run.log || ec=$?
+          echo "exit_code=${ec:-0}" >> $GITHUB_STEP_SUMMARY
+          if [ -f INSTANCE_CREATED ]; then
+            echo "## 🎉 INSTANCE CREATED" >> $GITHUB_STEP_SUMMARY
+            cat INSTANCE_CREATED >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload logs and generated keys
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-run-${{ github.run_id }}
+          path: |
+            INSTANCE_CREATED
+            grab_run.log
+            *.log
+            *_auto_generated
+          if-no-files-found: ignore
+          retention-days: 90
